@@ -1,6 +1,6 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, ClaimVersion, DefectItem, Feature, OfficeAction, Paragraph, Position, ReconcileResult, Response as DefectResponse, Role, ValidationIssue, WorkbenchState } from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
@@ -32,7 +32,7 @@ const initialAnnotations: Annotation[] = [
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, orphanMappings: [], versions: [], officeActions: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
 }
@@ -56,6 +56,7 @@ export class WorkbenchService implements OnDestroy {
   readonly selectedClaim$ = this.state$.pipe(map(state => state.claims.find(claim => claim.id === state.selectedClaimId) || state.claims[0]))
   readonly selectedFeature$ = this.state$.pipe(map(state => state.features.find(feature => feature.id === state.selectedFeatureId) || null))
   readonly issues$ = this.state$.pipe(map(state => this.validate(state)))
+  readonly officeActions$ = this.state$.pipe(map(state => state.officeActions))
 
   constructor() {
     if (typeof window !== 'undefined') window.addEventListener('beforeunload', () => this.savePosition())
@@ -147,7 +148,10 @@ export class WorkbenchService implements OnDestroy {
     if (this.stateSubject.value.role === 'viewer') return
     this.commit(state => {
       const feature = state.features.find(item => item.id === id)
-      if (feature) Object.assign(feature, patch)
+      if (feature) {
+        Object.assign(feature, patch)
+        this.refreshDefectResponseStatusForFeature(state, id)
+      }
     })
   }
 
@@ -158,7 +162,7 @@ export class WorkbenchService implements OnDestroy {
       if (!feature) return
       feature.supportIds.forEach(paragraphId => state.orphanMappings.push({
         id: `orphan-${Date.now()}-${paragraphId}`, featureLabel: feature.label, paragraphId,
-        reason: `技术特征“${feature.label}”已删除，但支持段落映射仍被保留。`
+        reason: `技术特征”${feature.label}”已删除，但支持段落映射仍被保留。`
       }))
       state.features = state.features.filter(item => item.id !== id)
       state.features.forEach(item => {
@@ -167,6 +171,7 @@ export class WorkbenchService implements OnDestroy {
       })
       state.annotations = state.annotations.filter(item => item.featureId !== id)
       state.selectedFeatureId = state.features.find(item => item.claimId === state.selectedClaimId)?.id || null
+      this.refreshDefectResponseStatusForFeature(state, id)
     })
   }
 
@@ -276,6 +281,257 @@ export class WorkbenchService implements OnDestroy {
     return `\uFEFF${csv}`
   }
 
+  // ── 审查意见管理 ──────────────────────────────────────────────
+
+  getOfficeAction(id: string): OfficeAction | undefined {
+    return this.stateSubject.value.officeActions.find(item => item.id === id)
+  }
+
+  importOfficeAction(data: { name: string; documentNumber: string; issuedAt: string; items: Array<{ text: string; conclusion?: 'upheld' | 'rejected' | 'pending' }> }): { id: string; duplicated: boolean } {
+    const existing = this.stateSubject.value.officeActions.find(item => item.documentNumber === data.documentNumber)
+    if (existing) {
+      // 同一份意见再送：不重复建，条目文字按审查意见更新，答复和依据按工作台保留
+      this.commit(state => {
+        const target = state.officeActions.find(item => item.documentNumber === data.documentNumber)
+        if (!target) return
+        data.items.forEach((incoming, index) => {
+          const sequence = index + 1
+          const existingItem = target.items.find(item => item.sequence === sequence)
+          if (existingItem) {
+            existingItem.text = incoming.text
+            if (incoming.conclusion) existingItem.conclusion = incoming.conclusion
+          } else {
+            target.items.push({
+              id: `defect-${Date.now()}-${sequence}`, officeActionId: target.id, sequence,
+              claimId: null, featureId: null, text: incoming.text,
+              conclusion: incoming.conclusion || 'pending', conclusionInvalid: false,
+              matched: false, response: null
+            })
+          }
+        })
+        // 移除审查意见中已不存在的条目（仅当未匹配时）
+        target.items = target.items.filter(item => data.items.some((_, index) => index + 1 === item.sequence))
+        target.reconciled = target.items.every(item => item.matched)
+      })
+      return { id: existing.id, duplicated: true }
+    }
+    const id = `office-${Date.now()}`
+    this.commit(state => {
+      const officeAction: OfficeAction = {
+        id, name: data.name, documentNumber: data.documentNumber, issuedAt: data.issuedAt,
+        createdAt: new Date().toISOString(), reconciled: false, reconciledAt: null, finalized: false, finalizedAt: null,
+        items: data.items.map((item, index) => ({
+          id: `defect-${Date.now()}-${index + 1}`, officeActionId: id, sequence: index + 1,
+          claimId: null, featureId: null, text: item.text,
+          conclusion: item.conclusion || 'pending', conclusionInvalid: false,
+          matched: false, response: null
+        }))
+      }
+      state.officeActions.push(officeAction)
+    })
+    return { id, duplicated: false }
+  }
+
+  reconcileOfficeAction(id: string): ReconcileResult {
+    const result: ReconcileResult = { matched: 0, unmatched: 0, total: 0, items: [] }
+    this.commit(state => {
+      const officeAction = state.officeActions.find(item => item.id === id)
+      if (!officeAction) return
+      result.total = officeAction.items.length
+      for (const item of officeAction.items) {
+        if (item.matched) {
+          result.matched++
+          result.items.push({ itemId: item.id, matched: true, claimId: item.claimId, featureId: item.featureId, reason: '已对上' })
+          continue
+        }
+        const match = this.autoMatchItem(item.text, state)
+        if (match) {
+          item.claimId = match.claimId
+          item.featureId = match.featureId
+          item.matched = true
+          result.matched++
+          result.items.push({ itemId: item.id, matched: true, claimId: match.claimId, featureId: match.featureId, reason: match.reason })
+        } else {
+          result.unmatched++
+          result.items.push({ itemId: item.id, matched: false, claimId: null, featureId: null, reason: '未能自动匹配，待人工认领' })
+        }
+      }
+      officeAction.reconciled = officeAction.items.every(item => item.matched)
+      if (officeAction.reconciled) officeAction.reconciledAt = new Date().toISOString()
+    })
+    return result
+  }
+
+  private autoMatchItem(text: string, state: WorkbenchState): { claimId: string; featureId: string; reason: string } | null {
+    // 提取权利要求编号
+    const claimMatch = text.match(/权利要求\s*(\d+)/)
+    if (!claimMatch) return null
+    const claimNumber = Number(claimMatch[1])
+    const claim = state.claims.find(item => item.number === claimNumber)
+    if (!claim) return null
+    // 提取特征标签
+    let feature: Feature | undefined
+    const letterMatch = text.match(/特征\s*([A-Z])/)
+    if (letterMatch) {
+      const letter = letterMatch[1]
+      feature = state.features.find(item => item.claimId === claim.id && item.label.includes(`· ${letter} `))
+    }
+    if (!feature) {
+      // 尝试按特征标签文字匹配
+      feature = state.features.find(item => item.claimId === claim.id && text.includes(item.label.split('·')[1]?.trim() || item.label))
+    }
+    if (!feature) return null
+    return { claimId: claim.id, featureId: feature.id, reason: `自动匹配权利要求${claimNumber} · ${feature.label}` }
+  }
+
+  matchDefectItem(itemId: string, claimId: string, featureId: string): void {
+    this.commit(state => {
+      const item = this.findDefectItem(state, itemId)
+      if (!item) return
+      item.claimId = claimId
+      item.featureId = featureId
+      item.matched = true
+      const officeAction = state.officeActions.find(oa => oa.id === item.officeActionId)
+      if (officeAction) {
+        officeAction.reconciled = officeAction.items.every(i => i.matched)
+        if (officeAction.reconciled) officeAction.reconciledAt = new Date().toISOString()
+      }
+    })
+  }
+
+  unmatchDefectItem(itemId: string): void {
+    this.commit(state => {
+      const item = this.findDefectItem(state, itemId)
+      if (!item) return
+      item.claimId = null
+      item.featureId = null
+      item.matched = false
+      const officeAction = state.officeActions.find(oa => oa.id === item.officeActionId)
+      if (officeAction) officeAction.reconciled = false
+    })
+  }
+
+  createResponse(itemId: string, type: 'amendment' | 'argument', text: string, basis: string, amendedFeatureId: string | null): void {
+    this.commit(state => {
+      const item = this.findDefectItem(state, itemId)
+      if (!item) return
+      let amendedFromText: string | null = null
+      if (type === 'amendment' && amendedFeatureId) {
+        const feature = state.features.find(f => f.id === amendedFeatureId)
+        if (feature) amendedFromText = feature.text
+      }
+      const response: DefectResponse = {
+        id: `response-${Date.now()}`, defectItemId: itemId, type, text, basis,
+        amendedFeatureId: type === 'amendment' ? amendedFeatureId : null,
+        amendedFromText, status: 'incomplete', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      }
+      response.status = this.computeDefectResponseStatus(response, state)
+      item.response = response
+    })
+  }
+
+  updateResponse(itemId: string, patch: Partial<Pick<DefectResponse, 'type' | 'text' | 'basis' | 'amendedFeatureId'>>): void {
+    this.commit(state => {
+      const item = this.findDefectItem(state, itemId)
+      if (!item || !item.response) return
+      const response = item.response
+      if (patch.type !== undefined) response.type = patch.type
+      if (patch.text !== undefined) response.text = patch.text
+      if (patch.basis !== undefined) response.basis = patch.basis
+      if (patch.amendedFeatureId !== undefined) {
+        response.amendedFeatureId = patch.amendedFeatureId
+        if (patch.type === 'amendment' || response.type === 'amendment') {
+          const feature = state.features.find(f => f.id === patch.amendedFeatureId)
+          response.amendedFromText = feature ? feature.text : null
+        }
+      }
+      response.updatedAt = new Date().toISOString()
+      response.status = this.computeDefectResponseStatus(response, state)
+    })
+  }
+
+  deleteResponse(itemId: string): void {
+    this.commit(state => {
+      const item = this.findDefectItem(state, itemId)
+      if (!item) return
+      item.response = null
+    })
+  }
+
+  private computeDefectResponseStatus(response: DefectResponse, state: WorkbenchState): 'complete' | 'incomplete' {
+    if (response.type === 'argument') {
+      return response.basis.trim() ? 'complete' : 'incomplete'
+    }
+    // amendment: 必须指向确实动过的特征
+    if (!response.amendedFeatureId) return 'incomplete'
+    const feature = state.features.find(f => f.id === response.amendedFeatureId)
+    if (!feature) return 'incomplete' // 特征被撤掉
+    if (response.amendedFromText !== null && feature.text === response.amendedFromText) return 'incomplete' // 特征被改回
+    return 'complete'
+  }
+
+  private refreshDefectResponseStatusForFeature(state: WorkbenchState, featureId: string): void {
+    for (const officeAction of state.officeActions) {
+      for (const item of officeAction.items) {
+        if (item.featureId === featureId) {
+          item.conclusionInvalid = true
+          if (item.response) item.response.status = this.computeDefectResponseStatus(item.response, state)
+        }
+      }
+    }
+  }
+
+  private findDefectItem(state: WorkbenchState, itemId: string): DefectItem | undefined {
+    for (const officeAction of state.officeActions) {
+      const item = officeAction.items.find(i => i.id === itemId)
+      if (item) return item
+    }
+    return undefined
+  }
+
+  finalizeOfficeAction(id: string): { ok: boolean; reason: string } {
+    const state = this.stateSubject.value
+    const officeAction = state.officeActions.find(item => item.id === id)
+    if (!officeAction) return { ok: false, reason: '未找到审查意见' }
+    if (!officeAction.reconciled) return { ok: false, reason: '尚有缺陷条目未对上，请先完成对账' }
+    const incomplete = officeAction.items.filter(item => !item.response || item.response.status !== 'complete')
+    if (incomplete.length) return { ok: false, reason: `尚有 ${incomplete.length} 条答复未完成` }
+    this.commit(state => {
+      const target = state.officeActions.find(item => item.id === id)
+      if (target) {
+        target.finalized = true
+        target.finalizedAt = new Date().toISOString()
+      }
+    })
+    return { ok: true, reason: '已定稿' }
+  }
+
+  exportComparisonTable(id: string): string {
+    const state = this.stateSubject.value
+    const officeAction = state.officeActions.find(item => item.id === id)
+    if (!officeAction) return ''
+    const rows = officeAction.items.map(item => {
+      const claim = state.claims.find(c => c.id === item.claimId)
+      const feature = state.features.find(f => f.id === item.featureId)
+      const response = item.response
+      return [
+        item.sequence,
+        claim ? `权利要求${claim.number}` : '未匹配',
+        feature ? feature.label : '未匹配',
+        item.text,
+        item.conclusion === 'upheld' ? '缺陷成立' : item.conclusion === 'rejected' ? '缺陷不成立' : '待定',
+        item.conclusionInvalid ? '已失效' : '有效',
+        response ? (response.type === 'amendment' ? '修改' : '讲理由') : '未答复',
+        response?.text || '',
+        response?.basis || '',
+        response?.status === 'complete' ? '已完成' : '未完成'
+      ]
+    })
+    const csv = [['序号', '权利要求', '技术特征', '审查意见', '审查员结论', '结论状态', '答复方式', '答复内容', '依据', '答复状态'], ...rows]
+      .map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n')
+    return `﻿${csv}`
+  }
+
   validate(state = this.stateSubject.value): ValidationIssue[] {
     const issues: ValidationIssue[] = []
     for (const feature of state.features) {
@@ -284,6 +540,17 @@ export class WorkbenchService implements OnDestroy {
       if (this.hasReferenceCycle(feature, state.features)) issues.push({ id: `cycle-${feature.id}`, severity: 'error', type: 'cycle', featureId: feature.id, title: `${feature.label} 存在循环引用`, detail: '特征层级或引用关系形成闭环，请移除其中一条关系。' })
     }
     state.orphanMappings.forEach(item => issues.push({ id: item.id, severity: 'warning', type: 'orphan-mapping', title: '存在待清理映射', detail: item.reason }))
+    // 审查意见相关问题
+    for (const officeAction of state.officeActions) {
+      if (!officeAction.reconciled) {
+        const unmatched = officeAction.items.filter(item => !item.matched).length
+        issues.push({ id: `office-reconcile-${officeAction.id}`, severity: 'warning', type: 'office-action', title: `${officeAction.name} 未完成对账`, detail: `尚有 ${unmatched} 条缺陷条目未对上，请先完成对账。` })
+      }
+      if (officeAction.reconciled && !officeAction.finalized) {
+        const incomplete = officeAction.items.filter(item => !item.response || item.response.status !== 'complete').length
+        if (incomplete) issues.push({ id: `office-response-${officeAction.id}`, severity: 'warning', type: 'office-action', title: `${officeAction.name} 答复未完成`, detail: `尚有 ${incomplete} 条答复未完成，完成后可定稿导出对照表。` })
+      }
+    }
     return issues
   }
 

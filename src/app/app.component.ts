@@ -10,7 +10,7 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, DefectItem, Feature, OfficeAction, ReconcileResult, Role, ValidationIssue, WorkbenchState } from './models'
 import { WorkbenchService } from './workbench.service'
 
 @Component({
@@ -35,6 +35,15 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     { label: '审查员（可编辑本人批注）', value: 'examiner' },
     { label: '观察者（只读）', value: 'viewer' }
   ]
+  // 审查意见相关
+  officeActionDialog = false
+  officeActionForm = { name: '', documentNumber: '', issuedAt: '', itemsText: '' }
+  selectedOfficeActionId: string | null = null
+  reconcileResult: ReconcileResult | null = null
+  responseDrafts: Record<string, { type: 'amendment' | 'argument'; text: string; basis: string; amendedFeatureId: string | null }> = {}
+  matchDialog = false
+  matchTarget: DefectItem | null = null
+  matchForm = { claimId: '', featureId: '' }
   private subscriptions = new Subscription()
 
   constructor(readonly service: WorkbenchService) {
@@ -133,6 +142,110 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       const after = b.claims.find(item => item.id === id)?.text || ''
       return { label: `权利要求 ${a.claims.find(item => item.id === id)?.number || b.claims.find(item => item.id === id)?.number || '?'}`, before, after, changed: before !== after }
     })
+  }
+
+  // ── 审查意见 ──────────────────────────────────────────────
+
+  get officeActions(): OfficeAction[] { return this.state.officeActions }
+  get selectedOfficeAction(): OfficeAction | undefined {
+    return this.state.officeActions.find(item => item.id === this.selectedOfficeActionId)
+  }
+  get unmatchedItems(): DefectItem[] {
+    return this.selectedOfficeAction?.items.filter(item => !item.matched) || []
+  }
+
+  openOfficeActionDialog(): void {
+    this.officeActionForm = { name: '', documentNumber: '', issuedAt: '', itemsText: '' }
+    this.officeActionDialog = true
+  }
+
+  submitOfficeAction(): void {
+    const items = this.officeActionForm.itemsText.split('\n').map(line => line.trim()).filter(Boolean).map(text => ({ text }))
+    if (!items.length) return
+    const result = this.service.importOfficeAction({
+      name: this.officeActionForm.name || `审查意见 ${new Date().toLocaleDateString('zh-CN')}`,
+      documentNumber: this.officeActionForm.documentNumber || `OA-${Date.now()}`,
+      issuedAt: this.officeActionForm.issuedAt || new Date().toISOString(),
+      items
+    })
+    this.selectedOfficeActionId = result.id
+    this.officeActionDialog = false
+    this.reconcileResult = null
+  }
+
+  selectOfficeAction(id: string): void {
+    this.selectedOfficeActionId = id
+    this.reconcileResult = null
+  }
+
+  reconcile(): void {
+    if (!this.selectedOfficeActionId) return
+    this.reconcileResult = this.service.reconcileOfficeAction(this.selectedOfficeActionId)
+  }
+
+  openMatchDialog(item: DefectItem): void {
+    this.matchTarget = item
+    this.matchForm = { claimId: item.claimId || '', featureId: item.featureId || '' }
+    this.matchDialog = true
+  }
+
+  submitMatch(): void {
+    if (!this.matchTarget || !this.matchForm.claimId || !this.matchForm.featureId) return
+    this.service.matchDefectItem(this.matchTarget.id, this.matchForm.claimId, this.matchForm.featureId)
+    this.matchDialog = false
+    this.matchTarget = null
+  }
+
+  unmatchItem(itemId: string): void {
+    this.service.unmatchDefectItem(itemId)
+  }
+
+  getResponseDraft(item: DefectItem) {
+    if (!this.responseDrafts[item.id]) {
+      this.responseDrafts[item.id] = {
+        type: item.response?.type || 'argument',
+        text: item.response?.text || '',
+        basis: item.response?.basis || '',
+        amendedFeatureId: item.response?.amendedFeatureId || null
+      }
+    }
+    return this.responseDrafts[item.id]
+  }
+
+  saveResponse(item: DefectItem): void {
+    const draft = this.responseDrafts[item.id]
+    if (!draft) return
+    if (item.response) {
+      this.service.updateResponse(item.id, { type: draft.type, text: draft.text, basis: draft.basis, amendedFeatureId: draft.amendedFeatureId })
+    } else {
+      this.service.createResponse(item.id, draft.type, draft.text, draft.basis, draft.amendedFeatureId)
+    }
+  }
+
+  deleteResponse(itemId: string): void {
+    this.service.deleteResponse(itemId)
+    delete this.responseDrafts[itemId]
+  }
+
+  finalize(): void {
+    if (!this.selectedOfficeActionId) return
+    const result = this.service.finalizeOfficeAction(this.selectedOfficeActionId)
+    if (!result.ok) alert(result.reason)
+  }
+
+  exportComparisonTable(): void {
+    if (!this.selectedOfficeActionId) return
+    const content = this.service.exportComparisonTable(this.selectedOfficeActionId)
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `审查意见对照表-${new Date().toISOString().slice(0, 10)}.csv`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  claimFeaturesForMatch(claimId: string): Feature[] {
+    return this.state.features.filter(item => item.claimId === claimId)
   }
 
   exportFile(type: 'json' | 'csv'): void {

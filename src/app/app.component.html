@@ -57,6 +57,7 @@
         <button [class.active]="state.activeTab === 'claim'" (click)="service.setTab('claim')"><i class="pi pi-file-edit"></i>权利要求录入</button>
         <button [class.active]="state.activeTab === 'compare'" (click)="service.setTab('compare')"><i class="pi pi-arrows-h"></i>版本比较</button>
         <button [class.active]="state.activeTab === 'audit'" (click)="service.setTab('audit')"><i class="pi pi-check-square"></i>核对清单</button>
+        <button [class.active]="state.activeTab === 'office'" (click)="service.setTab('office')"><i class="pi pi-inbox"></i>审查意见</button>
       </nav>
 
       <div class="view" *ngIf="state.activeTab === 'mapping'">
@@ -201,6 +202,92 @@
           </div>
         </section>
       </div>
+
+      <div class="view" *ngIf="state.activeTab === 'office'">
+        <section class="panel office-panel">
+          <div class="panel-heading">
+            <span>审查意见答复</span>
+            <span class="heading-actions">
+              <p-button label="导入审查意见" icon="pi pi-plus" size="small" (onClick)="openOfficeActionDialog()" />
+              <p-button *ngIf="selectedOfficeAction" label="对账" icon="pi pi-refresh" size="small" [outlined]="true" (onClick)="reconcile()" />
+              <p-button *ngIf="selectedOfficeAction" label="定稿并导出对照表" icon="pi pi-check-circle" size="small" (onClick)="finalize()" />
+            </span>
+          </div>
+
+          <div class="office-layout">
+            <div class="office-list">
+              <div class="office-list-item" *ngFor="let oa of officeActions" [class.active]="oa.id === selectedOfficeActionId" (click)="selectOfficeAction(oa.id)">
+                <strong>{{ oa.name }}</strong>
+                <small>{{ oa.documentNumber }} · {{ oa.items.length }} 条</small>
+                <span class="office-status" [class.ready]="oa.finalized" [class.pending]="!oa.finalized">
+                  {{ oa.finalized ? '已定稿' : oa.reconciled ? '对账完成' : '待对账' }}
+                </span>
+              </div>
+              <div *ngIf="!officeActions.length" class="empty-state large">尚未导入审查意见</div>
+            </div>
+
+            <div class="office-detail" *ngIf="selectedOfficeAction as oa">
+              <div class="office-meta">
+                <span>文号：{{ oa.documentNumber }}</span>
+                <span>条目：{{ oa.items.length }}</span>
+                <span>对账：{{ oa.reconciled ? '已完成' : '未完成' }}</span>
+                <span>定稿：{{ oa.finalized ? '已完成' : '未完成' }}</span>
+              </div>
+
+              <div *ngIf="reconcileResult" class="reconcile-summary" [class.ok]="reconcileResult.unmatched === 0">
+                对账结果：{{ reconcileResult.matched }} 条对上，{{ reconcileResult.unmatched }} 条待认领
+              </div>
+
+              <div class="defect-list">
+                <article class="defect-item" *ngFor="let item of oa.items" [class.matched]="item.matched" [class.unmatched]="!item.matched">
+                  <header>
+                    <span class="defect-seq">#{{ item.sequence }}</span>
+                    <span class="defect-match-status" [class.ok]="item.matched" [class.pending]="!item.matched">
+                      {{ item.matched ? '已对上' : '待认领' }}
+                    </span>
+                    <span class="defect-conclusion" [class.invalid]="item.conclusionInvalid">
+                      {{ item.conclusion === 'upheld' ? '缺陷成立' : item.conclusion === 'rejected' ? '缺陷不成立' : '待定' }}
+                      <em *ngIf="item.conclusionInvalid">（结论已失效）</em>
+                    </span>
+                  </header>
+                  <p class="defect-text">{{ item.text }}</p>
+                  <div class="defect-mapping" *ngIf="item.matched">
+                    <span>→ 权利要求{{ claimLabel(item.claimId!) }} · {{ featureLabel(item.featureId!) }}</span>
+                    <p-button label="解除匹配" size="small" [text]="true" (onClick)="unmatchItem(item.id)" />
+                  </div>
+                  <div class="defect-actions">
+                    <p-button *ngIf="!item.matched" label="人工认领" icon="pi pi-link" size="small" (onClick)="openMatchDialog(item)" />
+                  </div>
+
+                  <div class="response-editor" *ngIf="item.matched">
+                    <div class="response-type-row">
+                      <label><input type="radio" [name]="'rt-' + item.id" value="argument" [(ngModel)]="getResponseDraft(item).type"> 讲理由</label>
+                      <label><input type="radio" [name]="'rt-' + item.id" value="amendment" [(ngModel)]="getResponseDraft(item).type"> 修改特征</label>
+                    </div>
+                    <textarea pTextarea rows="2" placeholder="答复内容" [(ngModel)]="getResponseDraft(item).text"></textarea>
+                    <textarea pTextarea rows="2" placeholder="依据（讲理由时必填）" [(ngModel)]="getResponseDraft(item).basis"></textarea>
+                    <select *ngIf="getResponseDraft(item).type === 'amendment'" [(ngModel)]="getResponseDraft(item).amendedFeatureId">
+                      <option [ngValue]="null">选择改动的特征</option>
+                      <option *ngFor="let f of claimFeaturesForMatch(item.claimId!)" [value]="f.id">{{ f.label }}</option>
+                    </select>
+                    <div class="response-status-row">
+                      <span class="response-status" [class.complete]="item.response?.status === 'complete'" [class.incomplete]="item.response?.status === 'incomplete'">
+                        {{ item.response ? (item.response.status === 'complete' ? '已完成' : '未完成') : '未答复' }}
+                      </span>
+                      <p-button label="保存答复" size="small" (onClick)="saveResponse(item)" />
+                      <p-button *ngIf="item.response" label="删除答复" size="small" severity="danger" [text]="true" (onClick)="deleteResponse(item.id)" />
+                    </div>
+                  </div>
+                </article>
+              </div>
+
+              <div class="export-row" *ngIf="oa.finalized">
+                <p-button label="导出对照表" icon="pi pi-download" (onClick)="exportComparisonTable()" />
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
     </section>
 
     <aside class="inspector">
@@ -253,4 +340,42 @@
     <p>{{ issue.detail }}</p>
   </div>
   <ng-template pTemplate="footer"><p-button label="关闭" (onClick)="closeIssue()" /></ng-template>
+</p-dialog>
+
+<p-dialog header="导入审查意见" [(visible)]="officeActionDialog" [modal]="true" [style]="{ width: '560px' }">
+  <div class="dialog-body">
+    <label>名称<input pInputText [(ngModel)]="officeActionForm.name" placeholder="例如：第一次审查意见通知书"></label>
+    <label>文号<input pInputText [(ngModel)]="officeActionForm.documentNumber" placeholder="例如：CN202610000000.0"></label>
+    <label>发文日<input pInputText [(ngModel)]="officeActionForm.issuedAt" placeholder="例如：2026-09-01"></label>
+    <label>缺陷条目（每行一条）<textarea pTextarea rows="8" [(ngModel)]="officeActionForm.itemsText" placeholder="每行一条审查意见，例如：
+权利要求1的技术特征A缺少说明书依据
+权利要求2的从属权利要求附加技术特征E未被说明书充分公开"></textarea></label>
+    <p class="hint">同一份文号再次导入不会重复创建，条目文字按审查意见更新，已填答复保留。</p>
+  </div>
+  <ng-template pTemplate="footer">
+    <p-button label="取消" severity="secondary" [outlined]="true" (onClick)="officeActionDialog = false" />
+    <p-button label="导入并对账" icon="pi pi-check" (onClick)="submitOfficeAction()" />
+  </ng-template>
+</p-dialog>
+
+<p-dialog header="人工认领缺陷条目" [(visible)]="matchDialog" [modal]="true" [style]="{ width: '480px' }">
+  <div class="dialog-body" *ngIf="matchTarget">
+    <p class="match-text">{{ matchTarget.text }}</p>
+    <label>权利要求
+      <select [(ngModel)]="matchForm.claimId">
+        <option value="">选择权利要求</option>
+        <option *ngFor="let claim of state.claims" [value]="claim.id">权利要求{{ claim.number }} · {{ claim.title }}</option>
+      </select>
+    </label>
+    <label>技术特征
+      <select [(ngModel)]="matchForm.featureId">
+        <option value="">选择技术特征</option>
+        <option *ngFor="let f of claimFeaturesForMatch(matchForm.claimId)" [value]="f.id">{{ f.label }}</option>
+      </select>
+    </label>
+  </div>
+  <ng-template pTemplate="footer">
+    <p-button label="取消" severity="secondary" [outlined]="true" (onClick)="matchDialog = false" />
+    <p-button label="确认认领" icon="pi pi-check" (onClick)="submitMatch()" [disabled]="!matchForm.claimId || !matchForm.featureId" />
+  </ng-template>
 </p-dialog>

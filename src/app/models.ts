@@ -63,6 +63,7 @@ export interface WorkbenchState {
   annotations: Annotation[]
   orphanMappings: OrphanMapping[]
   versions: ClaimVersion[]
+  officeActions: OfficeAction[]
   role: Role
   selectedClaimId: string
   selectedFeatureId: string | null
@@ -73,8 +74,58 @@ export interface WorkbenchState {
 export interface ValidationIssue {
   id: string
   severity: 'error' | 'warning'
-  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature'
+  type: 'cycle' | 'missing-support' | 'orphan-mapping' | 'empty-feature' | 'office-action'
   featureId?: string
   title: string
   detail: string
+}
+
+// 审查意见
+export interface OfficeAction {
+  id: string
+  name: string
+  documentNumber: string
+  issuedAt: string
+  createdAt: string
+  items: DefectItem[]
+  reconciled: boolean
+  reconciledAt: string | null
+  finalized: boolean
+  finalizedAt: string | null
+}
+
+// 缺陷条目
+export interface DefectItem {
+  id: string
+  officeActionId: string
+  sequence: number
+  claimId: string | null
+  featureId: string | null
+  text: string
+  conclusion: 'upheld' | 'rejected' | 'pending'
+  conclusionInvalid: boolean
+  matched: boolean
+  response: Response | null
+}
+
+// 答复
+export interface Response {
+  id: string
+  defectItemId: string
+  type: 'amendment' | 'argument'
+  text: string
+  basis: string
+  amendedFeatureId: string | null
+  amendedFromText: string | null
+  status: 'complete' | 'incomplete'
+  createdAt: string
+  updatedAt: string
+}
+
+// 对账结果
+export interface ReconcileResult {
+  matched: number
+  unmatched: number
+  total: number
+  items: Array<{ itemId: string; matched: boolean; claimId: string | null; featureId: string | null; reason: string }>
 }
