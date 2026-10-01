@@ -56,6 +56,7 @@
         <button [class.active]="state.activeTab === 'mapping'" (click)="service.setTab('mapping')"><i class="pi pi-sitemap"></i>特征映射</button>
         <button [class.active]="state.activeTab === 'claim'" (click)="service.setTab('claim')"><i class="pi pi-file-edit"></i>权利要求录入</button>
         <button [class.active]="state.activeTab === 'compare'" (click)="service.setTab('compare')"><i class="pi pi-arrows-h"></i>版本比较</button>
+        <button [class.active]="state.activeTab === 'office'" (click)="service.setTab('office')"><i class="pi pi-comments"></i>审查意见答复</button>
         <button [class.active]="state.activeTab === 'audit'" (click)="service.setTab('audit')"><i class="pi pi-check-square"></i>核对清单</button>
       </nav>
 
@@ -186,6 +187,126 @@
         </section>
       </div>
 
+      <div class="view" *ngIf="state.activeTab === 'office'">
+        <section class="panel office-panel" *ngIf="selectedAction as action; else noOfficeAction">
+          <div class="office-header">
+            <div>
+              <div class="panel-heading"><span>{{ action.title }}</span>
+                <span class="status-chip" [class.ready]="canFinalize" [class.error-chip]="!canFinalize">{{ canFinalize ? '可定稿' : incompleteItems.length + ' 条未完成' }}</span>
+              </div>
+              <p class="hint">远程文号 {{ action.remoteId }} · {{ action.receivedAt | date:'yyyy-MM-dd HH:mm' }} 送达 · 同一份意见重复送达不会重复建条目</p>
+            </div>
+            <div class="office-actions">
+              <p-button label="送达/重传审查意见" icon="pi pi-send" severity="secondary" [outlined]="true" [disabled]="state.role !== 'examiner'" (onClick)="openIngestDialog()" pTooltip="审查员侧操作：按远程文号与条目键去重；条目文字按审查意见覆盖，答复按工作台保留" />
+              <p-button label="重试对账" icon="pi pi-refresh" severity="secondary" [outlined]="true" [disabled]="state.role === 'viewer' || !unclaimedItems.length" (onClick)="rematch(action)" pTooltip="只补还没对上的待认领条目" />
+              <p-button label="定稿并导出对照表" icon="pi pi-file-export" [disabled]="!canFinalize || state.role !== 'author'" (onClick)="finalizeAndExport(action)" pTooltip="条目全部对上且答复齐备时才能定稿" />
+              <p-button *ngIf="action.export as exported" label="再次下载定稿表" icon="pi pi-download" severity="success" [outlined]="true" (onClick)="exportReconciliation(action)" />
+            </div>
+          </div>
+          <p class="export-note" *ngIf="action.export as exported"><i class="pi pi-verified"></i>已于 {{ exported.finalizedAt | date:'yyyy-MM-dd HH:mm' }} 定稿；定稿后若特征再改动，相关审查员结论失效并需重新定稿。</p>
+          <p class="export-note warn" *ngIf="finalizeMessage"><i class="pi pi-info-circle"></i>{{ finalizeMessage }}</p>
+
+          <div class="office-summary">
+            <div><span>缺陷条目</span><strong>{{ action.items.length }}</strong></div>
+            <div><span>待认领</span><strong class="warn-num">{{ unclaimedItems.length }}</strong></div>
+            <div><span>答复未完成</span><strong [class.warn-num]="incompleteItems.length">{{ incompleteItems.length }}</strong></div>
+            <div><span>结论失效</span><strong class="warn-num">{{ staleCount(action) }}</strong></div>
+          </div>
+
+          <h3 class="office-section-title">待认领（自动对账未对上）</h3>
+          <div class="unclaimed-list" *ngIf="unclaimedItems.length">
+            <article class="oa-item unclaimed" *ngFor="let item of unclaimedItems">
+              <header class="oa-head">
+                <span class="defect-no">缺陷 {{ item.examiner.defectNo }}</span>
+                <p-badge [value]="defectLabel(item.examiner.defectType)" severity="warn" />
+                <small>审查员指向：权{{ item.examiner.suggestedClaimNumber ?? '?' }} · {{ item.examiner.suggestedFeatureLabel || '未指明特征' }}</small>
+              </header>
+              <p class="opinion">{{ item.examiner.opinionText }}</p>
+              <div class="claim-row">
+                <label>认领到<select [value]="claimDraft(item)" (change)="setClaimDraft(item, $any($event.target).value)">
+                  <option value="">请选择权利要求 / 特征…</option>
+                  <ng-container *ngFor="let c of state.claims">
+                    <option *ngFor="let f of claimFeatureOptions(c.id)" [value]="c.id + '::' + f.id">权{{ c.number }} · {{ f.label }}</option>
+                  </ng-container>
+                </select></label>
+                <p-button label="认领" icon="pi pi-link" size="small" [disabled]="state.role === 'viewer' || !claimDraft(item)" (onClick)="claimItem(action, item)" />
+              </div>
+            </article>
+          </div>
+          <div class="empty-state" *ngIf="!unclaimedItems.length">所有条目均已对上权利要求与技术特征。</div>
+
+          <h3 class="office-section-title">逐条答复</h3>
+          <div class="oa-list">
+            <article class="oa-item" *ngFor="let item of action.items" [class.unclaimed]="statusOf(item).status === 'unclaimed'" [class.incomplete]="statusOf(item).status === 'incomplete'" [class.complete]="statusOf(item).status === 'complete'">
+              <header class="oa-head">
+                <span class="defect-no">缺陷 {{ item.examiner.defectNo }}</span>
+                <p-badge [value]="defectLabel(item.examiner.defectType)" severity="secondary" />
+                <span class="oa-target"><i class="pi pi-sitemap"></i>
+                  <ng-container *ngIf="itemClaim(item) as c; else targetMissing">权{{ c.number }} · {{ itemFeature(item)?.label || '特征已撤掉' }}</ng-container>
+                  <ng-template #targetMissing>待认领</ng-template>
+                </span>
+                <span class="reply-state" [class.ok]="statusOf(item).status === 'complete'" [class.bad]="statusOf(item).status !== 'complete'">
+                  <i class="pi" [class.pi-check-circle]="statusOf(item).status === 'complete'" [class.pi-exclamation-circle]="statusOf(item).status !== 'complete'"></i>
+                  {{ statusOf(item).status === 'complete' ? '答复齐备' : statusOf(item).status === 'unclaimed' ? '待认领' : '答复未完成' }}
+                </span>
+              </header>
+              <p class="opinion"><strong>审查意见：</strong>{{ item.examiner.opinionText }}</p>
+
+              <div class="stale-banner" *ngIf="item.workbench.conclusionStale && statusOf(item).status === 'complete'">
+                <i class="pi pi-bolt"></i>挂载特征在本次意见后被改动，审查员先前的结论已失效，等待审查员重新认定。
+              </div>
+
+              <ng-container *ngIf="itemFeature(item) as feature">
+                <div class="baseline-note">
+                  <i class="pi" [class.pi-check]="featureChangedSinceBaseline(item)" [class.pi-clock]="!featureChangedSinceBaseline(item)"></i>
+                  <span>特征当前正文：{{ feature.text || '（空）' }}</span>
+                  <small>{{ featureChangedSinceBaseline(item) ? '较送达时确有改动，可标“已改”' : '与送达时一致：标“已改”前必须先在特征映射中修改这条特征' }}</small>
+                </div>
+
+                <div class="reply-form">
+                  <div class="reply-mode">
+                    <label [class.active]="replyModeDraft(item) === 'amend'">
+                      <input type="radio" [name]="'mode-' + item.id" value="amend" [checked]="replyModeDraft(item) === 'amend'" (change)="setReplyMode(item, 'amend')" [disabled]="state.role !== 'author'">
+                      已修改该特征
+                    </label>
+                    <label [class.active]="replyModeDraft(item) === 'argue'">
+                      <input type="radio" [name]="'mode-' + item.id" value="argue" [checked]="replyModeDraft(item) === 'argue'" (change)="setReplyMode(item, 'argue')" [disabled]="state.role !== 'author'">
+                      仅陈述理由
+                    </label>
+                  </div>
+                  <textarea pTextarea rows="3" [value]="replyTextDraft(item)" (input)="setReplyText(item, $any($event.target).value)" [readonly]="state.role !== 'author'" placeholder="代理人逐条答复：说明修改内容，或陈述意见并给出说明书依据…"></textarea>
+
+                  <div class="basis-picker" *ngIf="replyModeDraft(item) === 'argue'">
+                    <strong>答复依据（说明书段落）</strong>
+                    <label *ngFor="let paragraph of state.paragraphs">
+                      <input type="checkbox" [checked]="basisChecked(item, paragraph.id)" (change)="toggleBasis(item, paragraph.id, $any($event.target).checked)" [disabled]="state.role !== 'author'">
+                      <span>{{ paragraph.section }}</span>
+                    </label>
+                  </div>
+
+                  <div class="reply-actions">
+                    <p-button label="保存答复" icon="pi pi-save" size="small" [disabled]="state.role !== 'author' || !replyTextDraft(item).trim()" (onClick)="saveReply(action, item)" />
+                    <p-button label="定位特征" icon="pi pi-arrow-up-right" size="small" severity="secondary" [text]="true" (onClick)="locateItem(item)" />
+                    <p-button label="退回待认领" icon="pi pi-undo" size="small" severity="warn" [text]="true" [disabled]="state.role === 'viewer'" (onClick)="releaseItem(action, item)" />
+                  </div>
+                </div>
+
+                <div class="examiner-box" [class.stale]="item.workbench.conclusionStale">
+                  <strong>审查员结论 <em *ngIf="item.workbench.conclusionStale">（已失效）</em></strong>
+                  <textarea pTextarea rows="2" [value]="conclusionDraft(item)" (input)="setConclusionDraft(item, $any($event.target).value)" [readonly]="state.role !== 'examiner'" placeholder="审查员对答复的认定…"></textarea>
+                  <p-button label="保存结论" icon="pi pi-check" size="small" severity="secondary" [disabled]="state.role !== 'examiner' || !conclusionDraft(item).trim()" (onClick)="saveConclusion(action, item)" />
+                </div>
+              </ng-container>
+
+              <p class="status-reason"><i class="pi pi-info-circle"></i>{{ statusOf(item).reason }}</p>
+            </article>
+          </div>
+        </section>
+        <ng-template #noOfficeAction>
+          <section class="panel empty-state large">还没有审查意见。<p-button label="送达第一份审查意见" icon="pi pi-send" (onClick)="openIngestDialog()" /></section>
+        </ng-template>
+      </div>
+
       <div class="view" *ngIf="state.activeTab === 'audit'">
         <section class="panel audit-panel">
           <div class="panel-heading"><span>提交前核对清单</span><span class="status-chip" [class.ready]="!errorCount">{{ errorCount ? errorCount + ' 项待处理' : '校验通过' }}</span></div>
@@ -253,4 +374,16 @@
     <p>{{ issue.detail }}</p>
   </div>
   <ng-template pTemplate="footer"><p-button label="关闭" (onClick)="closeIssue()" /></ng-template>
+</p-dialog>
+
+<p-dialog header="送达审查意见（模拟审查员侧推送）" [(visible)]="ingestDialog" [modal]="true" [style]="{ width: '640px' }">
+  <div class="dialog-body">
+    <p>用纯文本录入审查意见。<strong>远程文号</strong>相同即视为同一份意见：不重复建档；条目按 <strong>编号</strong>（或远程条目键）匹配，条目文字以审查意见为准，代理人答复与依据以工作台为准。用 <code>---</code> 分隔缺陷条目。类型可选 novelty / inventive-step / clarity / support / formal / other。</p>
+    <textarea pTextarea rows="16" [(ngModel)]="ingestRaw" spellcheck="false" class="ingest-textarea"></textarea>
+    <p class="export-note warn" *ngIf="ingestMessage"><i class="pi pi-info-circle"></i>{{ ingestMessage }}</p>
+  </div>
+  <ng-template pTemplate="footer">
+    <p-button label="取消" severity="secondary" [outlined]="true" (onClick)="ingestDialog = false" />
+    <p-button label="送达并自动对账" icon="pi pi-send" (onClick)="submitIngest()" />
+  </ng-template>
 </p-dialog>
